@@ -210,7 +210,7 @@ Bacon.combineAsArray = (streams, more...) ->
           ((x) -> values[index] = new Some(x)))
       for stream, index in streams
         stream = Bacon.constant(stream) if not (stream instanceof Observable)
-        unsubs[index] = stream.subscribe (sinkFor index) unless unsubscribed
+        unsubs[index] = stream.subscribeInternal (sinkFor index) unless unsubscribed
       unsubAll
   else
     Bacon.constant([])
@@ -542,6 +542,7 @@ class EventStream extends Observable
     assertFunction subscribe
     dispatcher = new Dispatcher(subscribe)
     @subscribe = dispatcher.subscribe
+    @subscribeInternal = @subscribe
     @hasSubscribers = dispatcher.hasSubscribers
   map: (p, args...) ->
     if (p instanceof Property)
@@ -655,7 +656,7 @@ class EventStream extends Observable
   withSubscribe: (subscribe) -> new EventStream(subscribe)
 
 class Property extends Observable
-  constructor: (@subscribe) ->
+  constructor: (@subscribeInternal) ->
     super()
     combine = (other, leftSink, rightSink) =>
       myVal = None
@@ -699,8 +700,8 @@ class Property extends Observable
 
         mySink = combiningSink (-> myEnd = true), ((value) -> myVal = value), leftSink
         otherSink = combiningSink (-> otherEnd = true), ((value) -> otherVal = value), rightSink
-        unsubMe = this.subscribe mySink
-        unsubOther = other.subscribe otherSink unless unsubscribed
+        unsubMe = this.subscribeInternal mySink
+        unsubOther = other.subscribeInternal otherSink unless unsubscribed
         unsubBoth
     @combine = (other, f) =>
       combinator = toCombinator(f)
@@ -713,14 +714,43 @@ class Property extends Observable
       values = combine(sampler, nop, pushPropertyValue)
       values = values.changes() if sampler instanceof EventStream
       values.takeUntil(sampler.filter(false).mapEnd())
+
+    @subscribe = (sink) =>
+      # TODO: nämä tehdään nyt joka listenerille erikseen
+      _value = undefined
+      _end = undefined
+      reply = Bacon.more
+      unsub = @subscribeInternal (event) =>
+        if event.isError()
+          reply = sink event if reply != Bacon.noMore
+          reply
+        else
+          if event.hasValue()
+            _value = event
+          else if event.isEnd()
+            _end = event
+          PropertyTransaction.onDone ->
+            __value = _value
+            __end = _end
+            _value = undefined
+            _end = undefined
+            reply = sink(__value) if __value? and reply != Bacon.noMore
+            reply = sink(__end) if __end? and reply != Bacon.noMore
+            if reply == Bacon.noMore
+              if unsub?
+                unsub()
+              else
+                setTimeout 0, unsub
+
   sample: (interval) =>
     @sampledBy Bacon.interval(interval, {})
 
   changes: => new EventStream (sink) =>
     @subscribe (event) =>
+      #console.log "CHANGES", event.describe()
       sink event unless event.isInitial()
   withHandler: (handler) ->
-    new Property(new PropertyDispatcher(@subscribe, handler).subscribe)
+    new Property(new PropertyDispatcher(@subscribeInternal, handler).subscribe)
   withSubscribe: (subscribe) -> new Property(new PropertyDispatcher(subscribe).subscribe)
   toProperty: =>
     assertNoArguments(arguments)
@@ -743,6 +773,7 @@ addPropertyInitValueToStream = (property, stream) ->
     value = None
     property.subscribe (event) ->
       if event.isInitial()
+        #console.log("got init value", event.value())
         value = new Some(event.value())
       Bacon.noMore
     value
@@ -825,7 +856,9 @@ class PropertyDispatcher extends Dispatcher
         ended = true
       if event.hasValue()
         current = new Some(event.value())
-      push.apply(this, [event])
+        #console.log "push", event.value()
+      PropertyTransaction.inTransaction =>
+        push.apply(this, [event])
     @subscribe = (sink) =>
       initSent = false
       # init value is "bounced" here because the base Dispatcher class
@@ -842,6 +875,28 @@ class PropertyDispatcher extends Dispatcher
         nop
       else
         subscribe.apply(this, [sink])
+
+PropertyTransaction = (->
+  txListeners = []
+  tx = false
+  onDone = (f) -> if tx then txListeners.push(f) else f()
+  inTransaction = (f) ->
+    if tx
+      #console.log "in tx"
+      f()
+    else
+      #console.log "start tx"
+      tx = true
+      try
+        f()
+      finally
+        tx = false
+      gs = txListeners
+      #console.log "after tx", txListeners.length
+      txListeners = []
+      g() for g in gs
+  { onDone, inTransaction }
+ )()
 
 class Bus extends EventStream
   constructor: ->
